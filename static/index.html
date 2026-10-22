@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Novel → Animation Studio</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-size: 1.4rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 16px 0; background: #fff; }
+    pre { background: #f6f6f6; padding: 12px; border-radius: 6px; overflow: auto; max-height: 300px; }
+    button { padding: 8px 14px; border-radius: 6px; border: 1px solid #333; background: #111; color: #fff; cursor: pointer; font-weight: bold; transition: 0.2s; }
+    button:hover:not(:disabled) { opacity: 0.8; }
+    button:disabled { opacity: .5; cursor: default; }
+    .muted { color: #666; font-size: .9rem; }
+    progress { width: 100%; height: 8px; }
+    
+    /* Episode plan styles */
+    .episode-box { border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-bottom: 16px; background: #fafafa; }
+    .scene-item { border-left: 3px solid #0066cc; padding-left: 10px; margin-top: 10px; font-size: 0.9rem; }
+    .scene-item i { color: #555; }
+    
+    /* Gallery & Video styles */
+    #imageGallery { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+    #imageGallery img { width: 280px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    #finalVideo { width: 100%; max-width: 600px; margin-top: 16px; border-radius: 8px; box-shadow: 0 8px 16px rgba(0,0,0,0.2); display: none; }
+  </style>
+</head>
+<body>
+  <h1>Novel → Animation Studio</h1>
+
+  <!-- STEP 1: UPLOAD -->
+  <div class="card">
+    <h2>1. Upload a book</h2>
+    <input id="file" type="file" accept=".pdf,.docx,.txt" />
+    <button id="uploadBtn">Upload &amp; analyze</button>
+    <p class="muted" id="uploadStatus"></p>
+    <progress id="uploadProgress" value="0" max="100" hidden></progress>
+  </div>
+
+  <!-- STEP 2: PLAN & ART -->
+  <div class="card">
+    <h2>2. Episode plan &amp; Art</h2>
+    <button id="planBtn" disabled>Create episode plan</button>
+    <p class="muted" id="planStatus"></p>
+    
+    <div id="planContainer" hidden style="margin-top: 20px;">
+      <h3 id="seriesTitle" style="margin-bottom: 10px;"></h3>
+      <div id="episodesList"></div>
+      
+      <hr style="border: 0; border-top: 1px solid #ddd; margin: 20px 0;">
+      
+      <!-- Image Generation -->
+      <button id="generateImagesBtn" style="background: #0066cc;">Generate Episode 1 Images</button>
+      <p class="muted" id="imageStatus"></p>
+      <div id="imageGallery"></div>
+
+      <!-- Video Generation -->
+      <div id="videoSection" style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 20px;">
+        <h3>3. Final Animation</h3>
+        <button id="generateVideoBtn" style="background: #e63946;" disabled>Generate Episode 1 Video</button>
+        <p class="muted" id="videoStatus"></p>
+        <video id="finalVideo" controls></video>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let projectId = null;
+    let currentPlan = null;
+
+    async function pollJob(jobId, onUpdate) {
+      while (true) {
+        const r = await fetch(`/api/jobs/${jobId}`);
+        const j = await r.json();
+        onUpdate(j);
+        if (j.status === "done" || j.status === "error") return j;
+        await new Promise(res => setTimeout(res, 1500));
+      }
+    }
+
+    // --- UPLOAD & STORY BIBLE ---
+    document.getElementById("uploadBtn").onclick = async () => {
+      const f = document.getElementById("file").files[0];
+      if (!f) return;
+
+      const status = document.getElementById("uploadStatus");
+      const bar = document.getElementById("uploadProgress");
+      bar.hidden = false;
+      bar.value = 0;
+
+      status.textContent = "Uploading…";
+      const fd = new FormData();
+      fd.append("file", f);
+      
+      try {
+        const r = await fetch("/api/upload", { method: "POST", body: fd });
+        const data = await r.json();
+        
+        if (data.detail) throw new Error(data.detail);
+        
+        projectId = data.project_id;
+        status.textContent = `Extracted ${data.chars} characters. Analyzing story…`;
+
+        const job = await pollJob(data.story_bible_job, j => {
+          if (j.status === "running") {
+            const { done, total } = j.progress || {};
+            const stage = j.stage || "working";
+            if (total > 0) {
+              status.textContent = `Story bible: analyzing chunk ${done}/${total}…`;
+              bar.value = Math.round((done / total) * 100);
+            }
+          }
+        });
+
+        if (job.status === "done") {
+          status.textContent = "Story bible ready.";
+          bar.value = 100;
+          document.getElementById("planBtn").disabled = false;
+        } else {
+          status.textContent = "Error: " + (job.error || "Unknown error");
+        }
+      } catch (e) {
+        status.textContent = "Upload failed: " + e.message;
+      }
+    };
+
+    // --- EPISODE PLAN ---
+    document.getElementById("planBtn").onclick = async () => {
+      const status = document.getElementById("planStatus");
+      status.textContent = "Queuing…";
+      
+      const r = await fetch("/api/create-episode-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId, episode_count: 3 }),
+      });
+      const data = await r.json();
+      
+      const job = await pollJob(data.job_id, j => 
+        status.textContent = `Episode plan: ${j.status}…`);
+      
+      if (job.status === "done") {
+        status.textContent = "Episode plan ready.";
+        currentPlan = job.result;
+        renderPlan(currentPlan);
+      } else {
+        status.textContent = "Error: " + (job.error || "Unknown error");
+      }
+    };
+
+    function renderPlan(plan) {
+      document.getElementById("planContainer").hidden = false;
+      document.getElementById("seriesTitle").textContent = plan.series_title;
+      
+      const list = document.getElementById("episodesList");
+      list.innerHTML = "";
+      
+      plan.episodes.forEach(ep => {
+        const epDiv = document.createElement("div");
+        epDiv.className = "episode-box";
+        
+        let scenesHtml = ep.scenes.map(s => 
+          `<div class="scene-item">
+             <b>Scene ${s.number}:</b> ${s.setting}<br>
+             <i>Prompt: "${s.visual_prompt}"</i>
+           </div>`
+        ).join("");
+        
+        epDiv.innerHTML = `
+          <h4>Episode ${ep.number}: ${ep.title}</h4>
+          <p class="muted">${ep.summary}</p>
+          ${scenesHtml}
+        `;
+        list.appendChild(epDiv);
+      });
+    }
+
+    // --- IMAGE GENERATION ---
+    document.getElementById("generateImagesBtn").onclick = async () => {
+      if (!currentPlan) return;
+      
+      const btn = document.getElementById("generateImagesBtn");
+      const status = document.getElementById("imageStatus");
+      const gallery = document.getElementById("imageGallery");
+      
+      btn.disabled = true;
+      gallery.innerHTML = "";
+      
+      const ep1 = currentPlan.episodes[0];
+      
+      for (const scene of ep1.scenes) {
+        status.textContent = `Generating Scene ${scene.number} (waiting for rate limit)...`;
+        try {
+          const res = await fetch("/api/generate-scene-image", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_id: projectId,
+              episode_num: 1,
+              scene_num: scene.number,
+              prompt: scene.visual_prompt
+            })
+          });
+          
+          const imgData = await res.json();
+          
+          if (imgData.image_url) {
+             const img = document.createElement("img");
+             img.src = imgData.image_url + "?t=" + Date.now(); 
+             gallery.appendChild(img);
+          }
+        } catch (e) {
+          console.error("Image failed for scene", scene.number, e);
+        }
+      }
+      
+      status.textContent = "All images generated! You can now build the video.";
+      btn.disabled = false;
+      
+      // Unlock video button
+      document.getElementById("generateVideoBtn").disabled = false;
+    };
+
+    // --- VIDEO GENERATION ---
+    document.getElementById("generateVideoBtn").onclick = async () => {
+      if (!currentPlan) return;
+      
+      const btn = document.getElementById("generateVideoBtn");
+      const status = document.getElementById("videoStatus");
+      const videoPlayer = document.getElementById("finalVideo");
+      
+      btn.disabled = true;
+      status.textContent = "Building video... (generating voices and rendering via FFmpeg). This takes 1-2 minutes per scene.";
+      videoPlayer.style.display = "none";
+      
+      const ep1 = currentPlan.episodes[0];
+      
+      try {
+        const res = await fetch("/api/build-video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_id: projectId,
+            episode: ep1
+          })
+        });
+        
+        const data = await res.json();
+        
+        if (data.video_url) {
+          status.textContent = "Video ready!";
+          videoPlayer.src = data.video_url;
+          videoPlayer.style.display = "block";
+        } else {
+          status.textContent = "Error: " + (data.detail || "Failed to build video.");
+        }
+      } catch (e) {
+        console.error(e);
+        status.textContent = "Error building video.";
+      }
+      
+      btn.disabled = false;
+    };
+  </script>
+</body>
+</html>
